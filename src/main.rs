@@ -382,13 +382,6 @@ fn exec_on_package(
             package.manifest_path.strip_prefix(&cx.current_dir).unwrap_or(&package.manifest_path),
         );
     }
-    let target_dir = env::current_dir().unwrap().join("target").join(format!(
-        "{}_{}",
-        kind.to_string(),
-        nanoid!()
-    ));
-    line.arg("--target-dir");
-    line.arg(target_dir);
 
     exec_actual(cx, id, kind, &mut line, &progress, &keep_going)
 }
@@ -540,7 +533,14 @@ fn exec_cargo_inner(
         write!(msg, " ({}/{})", progress.count, progress.total).unwrap();
         info!("{msg}");
     }
-    line.run()
+    let target_dir = env::current_dir().unwrap().join("target").join(format!(
+        "{}",
+        // kind.to_string(),
+        nanoid!()
+    ));
+    // line.arg("--target-dir");
+    // line.arg(target_dir);
+    line.run_with_env(("CARGO_TARGET_DIR", target_dir.to_str().unwrap()))
 }
 
 fn cargo_clean(cx: &Context, id: Option<&PackageId>) -> Result<()> {

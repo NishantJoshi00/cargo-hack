@@ -133,6 +133,24 @@ impl<'a> ProcessBuilder<'a> {
         }
     }
 
+    /// Functionally similar to `run(&mut self) -> Result<()>` but with support to provide
+    /// key-value pair of environment variable
+    pub(crate) fn run_with_env<'b>(&mut self, env: (&'b str, &'b str)) -> Result<()> {
+        let status = self.build().env(env.0, env.1).status().with_context(|| {
+            ProcessError::new(&format!("could not execute process {self:#}"), None, None)
+        })?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(ProcessError::new(
+                &format!("process didn't exit successfully: {self:#}"),
+                Some(status),
+                None,
+            )
+            .into())
+        }
+    }
+
     /// Executes a process, captures its stdio output, returning the captured
     /// output, or an error if non-zero exit status.
     pub(crate) fn run_with_output(&mut self) -> Result<Output> {
