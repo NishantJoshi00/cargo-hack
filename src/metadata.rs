@@ -8,7 +8,7 @@ use std::{
     collections::{BTreeMap, HashMap},
     ffi::OsStr,
     path::{Path, PathBuf},
-    rc::Rc,
+    sync::Arc,
 };
 
 use anyhow::{format_err, Context as _, Result};
@@ -24,12 +24,17 @@ type ParseResult<T> = Result<T, &'static str>;
 pub(crate) struct PackageId {
     /// The underlying string representation of id.
     /// The precise format is an implementation detail and is subject to change.
-    repr: Rc<str>,
+    repr: Arc<str>,
 }
 
 impl From<String> for PackageId {
     fn from(repr: String) -> Self {
         Self { repr: repr.into() }
+    }
+}
+impl<'a> From<&'a PackageId> for &'a str {
+    fn from(item: &'a PackageId) -> Self {
+        &item.repr
     }
 }
 

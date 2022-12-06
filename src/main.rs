@@ -24,9 +24,13 @@ use std::{
     collections::BTreeMap,
     env,
     fmt::{self, Write},
+    sync,
 };
 
 use anyhow::{bail, Result};
+pub const CURRENT: &str = env!("CARGO_MANIFEST_DIR");
+use nanoid::nanoid;
+use rayon::prelude::*;
 
 use crate::{
     context::Context, features::Feature, metadata::PackageId, process::ProcessBuilder,
@@ -75,20 +79,24 @@ fn exec_on_workspace(cx: &Context) -> Result<()> {
         return Ok(());
     }
 
-    let mut progress = Progress::default();
-    let packages = determine_package_list(cx, &mut progress)?;
-    let mut keep_going = KeepGoing::default();
+    let progress = sync::Arc::new(sync::Mutex::new(Progress::default()));
+    let packages = determine_package_list(cx, &progress)?;
+    let keep_going = sync::Arc::new(sync::Mutex::new(KeepGoing::default()));
     if let Some(range) = &cx.version_range {
-        let total = progress.total;
-        progress.total = 0;
-        for (cargo_version, _) in range {
-            if cx.target.is_empty() || *cargo_version >= 64 {
-                progress.total += total;
-            } else {
-                progress.total += total * cx.target.len();
+        let line = {
+            let mut progress = progress.lock().unwrap();
+            let total = progress.total;
+            progress.total = 0;
+            for (cargo_version, _) in range {
+                if cx.target.is_empty() || *cargo_version >= 64 {
+                    progress.total += total;
+                } else {
+                    progress.total += total * cx.target.len();
+                }
             }
-        }
-        let line = cmd!("cargo");
+            let line = cmd!("cargo");
+            line
+        };
         {
             // First, generate the lockfile using the oldest cargo specified.
             // https://github.com/taiki-e/cargo-hack/issues/105
@@ -124,13 +132,28 @@ fn exec_on_workspace(cx: &Context) -> Result<()> {
             let mut line = line.clone();
             line.leading_arg(toolchain);
             line.apply_context(cx);
-            exec_on_packages(cx, &packages, line, &mut progress, &mut keep_going, *cargo_version)
+            exec_on_packages(
+                cx,
+                &packages,
+                line,
+                progress.clone(),
+                keep_going.clone(),
+                *cargo_version,
+            )
         })?;
     } else {
         let mut line = cx.cargo();
         line.apply_context(cx);
-        exec_on_packages(cx, &packages, line, &mut progress, &mut keep_going, cx.cargo_version)?;
+        exec_on_packages(
+            cx,
+            &packages,
+            line,
+            progress.clone(),
+            keep_going.clone(),
+            cx.cargo_version,
+        )?;
     }
+    let keep_going = keep_going.lock().unwrap();
     if keep_going.count > 0 {
         eprintln!();
         error!("{keep_going}");
@@ -155,12 +178,24 @@ enum Kind<'a> {
     Powerset { features: Vec<Vec<&'a Feature>> },
 }
 
+impl ToString for Kind<'_> {
+    fn to_string(&self) -> String {
+        String::from(match self {
+            &Kind::SkipAsPrivate => "skip_as_private",
+            &Kind::Normal => "normal",
+            &Kind::Each { .. } => "each",
+            &Kind::Powerset { .. } => "powerest",
+        })
+    }
+}
+
 fn determine_kind<'a>(
     cx: &'a Context,
     id: &PackageId,
-    progress: &mut Progress,
+    progress: &sync::Arc<sync::Mutex<Progress>>,
     multiple_packages: bool,
 ) -> Kind<'a> {
+    let mut progress = progress.lock().unwrap();
     assert!(cx.subcommand.is_some());
     if cx.ignore_private && cx.is_private(id) {
         info!("skipped running on private package `{}`", cx.name_verbose(id));
@@ -262,7 +297,7 @@ fn determine_kind<'a>(
 
 fn determine_package_list<'a>(
     cx: &'a Context,
-    progress: &mut Progress,
+    progress: &sync::Arc<sync::Mutex<Progress>>,
 ) -> Result<Vec<(&'a PackageId, Kind<'a>)>> {
     Ok(if cx.workspace {
         for spec in &cx.exclude {
@@ -312,8 +347,8 @@ fn exec_on_packages(
     cx: &Context,
     packages: &[(&PackageId, Kind<'_>)],
     mut line: ProcessBuilder<'_>,
-    progress: &mut Progress,
-    keep_going: &mut KeepGoing,
+    progress: sync::Arc<sync::Mutex<Progress>>,
+    keep_going: sync::Arc<sync::Mutex<KeepGoing>>,
     cargo_version: u32,
 ) -> Result<()> {
     if cx.target.is_empty() || cargo_version >= 64 {
@@ -322,16 +357,16 @@ fn exec_on_packages(
             line.arg("--target");
             line.arg(target);
         }
-        packages
-            .iter()
-            .try_for_each(|(id, kind)| exec_on_package(cx, id, kind, &line, progress, keep_going))
+        packages.par_iter().try_for_each(|(id, kind)| {
+            exec_on_package(cx, id, kind, &line, progress.clone(), keep_going.clone())
+        })
     } else {
         cx.target.iter().try_for_each(|target| {
             let mut line = line.clone();
             line.arg("--target");
             line.arg(target);
-            packages.iter().try_for_each(|(id, kind)| {
-                exec_on_package(cx, id, kind, &line, progress, keep_going)
+            packages.par_iter().try_for_each(|(id, kind)| {
+                exec_on_package(cx, id, kind, &line, progress.clone(), keep_going.clone())
             })
         })
     }
@@ -342,8 +377,8 @@ fn exec_on_package(
     id: &PackageId,
     kind: &Kind<'_>,
     line: &ProcessBuilder<'_>,
-    progress: &mut Progress,
-    keep_going: &mut KeepGoing,
+    progress: sync::Arc<sync::Mutex<Progress>>,
+    keep_going: sync::Arc<sync::Mutex<KeepGoing>>,
 ) -> Result<()> {
     if let Kind::SkipAsPrivate = kind {
         return Ok(());
@@ -360,6 +395,13 @@ fn exec_on_package(
             package.manifest_path.strip_prefix(&cx.current_dir).unwrap_or(&package.manifest_path),
         );
     }
+    let target_dir = env::current_dir().unwrap().join("target").join(format!(
+        "{}_{}",
+        kind.to_string(),
+        nanoid!()
+    ));
+    line.arg("--target-dir");
+    line.arg(target_dir);
 
     exec_actual(cx, id, kind, &mut line, progress, keep_going)
 }
@@ -369,14 +411,14 @@ fn exec_actual(
     id: &PackageId,
     kind: &Kind<'_>,
     line: &mut ProcessBuilder<'_>,
-    progress: &mut Progress,
-    keep_going: &mut KeepGoing,
+    progress: sync::Arc<sync::Mutex<Progress>>,
+    keep_going: sync::Arc<sync::Mutex<KeepGoing>>,
 ) -> Result<()> {
     match kind {
         Kind::SkipAsPrivate => unreachable!(),
         Kind::Normal => {
             // only run with default features
-            return exec_cargo(cx, id, line, progress, keep_going);
+            return exec_cargo(cx, id, line, &progress, &keep_going);
         }
         Kind::Each { .. } | Kind::Powerset { .. } => {}
     }
@@ -394,19 +436,19 @@ fn exec_actual(
 
     if !cx.exclude_no_default_features {
         // run with no default features if the package has other features
-        exec_cargo(cx, id, &mut line, progress, keep_going)?;
+        exec_cargo(cx, id, &mut line, &progress, &keep_going)?;
     }
 
     match kind {
         Kind::Each { features } => {
             features.iter().try_for_each(|f| {
-                exec_cargo_with_features(cx, id, &line, progress, keep_going, Some(f))
+                exec_cargo_with_features(cx, id, &line, &progress, &keep_going, Some(f))
             })?;
         }
         Kind::Powerset { features } => {
             // The first element of a powerset is `[]` so it should be skipped.
             features.iter().skip(1).try_for_each(|f| {
-                exec_cargo_with_features(cx, id, &line, progress, keep_going, f)
+                exec_cargo_with_features(cx, id, &line, &progress, &keep_going, f)
             })?;
         }
         _ => unreachable!(),
@@ -419,7 +461,7 @@ fn exec_actual(
         // run with all features
         // https://github.com/taiki-e/cargo-hack/issues/42
         line.arg("--all-features");
-        exec_cargo(cx, id, &mut line, progress, keep_going)?;
+        exec_cargo(cx, id, &mut line, &progress, &keep_going)?;
     }
 
     Ok(())
@@ -429,13 +471,13 @@ fn exec_cargo_with_features(
     cx: &Context,
     id: &PackageId,
     line: &ProcessBuilder<'_>,
-    progress: &mut Progress,
-    keep_going: &mut KeepGoing,
+    progress: &sync::Arc<sync::Mutex<Progress>>,
+    keep_going: &sync::Arc<sync::Mutex<KeepGoing>>,
     features: impl IntoIterator<Item = impl AsRef<str>>,
 ) -> Result<()> {
     let mut line = line.clone();
     line.append_features(features);
-    exec_cargo(cx, id, &mut line, progress, keep_going)
+    exec_cargo(cx, id, &mut line, progress, &keep_going)
 }
 
 #[derive(Default)]
@@ -463,12 +505,13 @@ fn exec_cargo(
     cx: &Context,
     id: &PackageId,
     line: &mut ProcessBuilder<'_>,
-    progress: &mut Progress,
-    keep_going: &mut KeepGoing,
+    progress: &sync::Arc<sync::Mutex<Progress>>,
+    keep_going: &sync::Arc<sync::Mutex<KeepGoing>>,
 ) -> Result<()> {
     let res = exec_cargo_inner(cx, id, line, progress);
     if cx.keep_going {
         if let Err(e) = res {
+            let mut keep_going = keep_going.lock().unwrap();
             error!("{e:#}");
             keep_going.count = keep_going.count.saturating_add(1);
             let name = cx.packages(id).name.clone();
@@ -487,27 +530,29 @@ fn exec_cargo_inner(
     cx: &Context,
     id: &PackageId,
     line: &mut ProcessBuilder<'_>,
-    progress: &mut Progress,
+    progress: &sync::Arc<sync::Mutex<Progress>>,
 ) -> Result<()> {
-    if progress.count != 0 {
-        eprintln!();
-    }
-    progress.count += 1;
+    {
+        let mut progress = progress.lock().unwrap();
+        if progress.count != 0 {
+            eprintln!();
+        }
+        progress.count += 1;
 
-    if cx.clean_per_run {
-        cargo_clean(cx, Some(id))?;
-    }
+        if cx.clean_per_run {
+            cargo_clean(cx, Some(id))?;
+        }
 
-    // running `<command>` (on <package>) (<count>/<total>)
-    let mut msg = String::new();
-    if term::verbose() {
-        write!(msg, "running {line}").unwrap();
-    } else {
-        write!(msg, "running {line} on {}", cx.packages(id).name).unwrap();
+        // running `<command>` (on <package>) (<count>/<total>)
+        let mut msg = String::new();
+        if term::verbose() {
+            write!(msg, "running {line}").unwrap();
+        } else {
+            write!(msg, "running {line} on {}", cx.packages(id).name).unwrap();
+        }
+        write!(msg, " ({}/{})", progress.count, progress.total).unwrap();
+        info!("{msg}");
     }
-    write!(msg, " ({}/{})", progress.count, progress.total).unwrap();
-    info!("{msg}");
-
     line.run()
 }
 
