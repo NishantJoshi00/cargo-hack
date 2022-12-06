@@ -32,11 +32,6 @@ impl From<String> for PackageId {
         Self { repr: repr.into() }
     }
 }
-impl<'a> From<&'a PackageId> for &'a str {
-    fn from(item: &'a PackageId) -> Self {
-        &item.repr
-    }
-}
 
 pub(crate) struct Metadata {
     pub(crate) cargo_version: u32,
