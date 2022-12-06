@@ -84,7 +84,7 @@ fn exec_on_workspace(cx: &Context) -> Result<()> {
     let keep_going = sync::Arc::new(sync::Mutex::new(KeepGoing::default()));
     if let Some(range) = &cx.version_range {
         let line = {
-            let mut progress = progress.lock().unwrap();
+            let mut progress = unpoison_mutex(progress.lock());
             let total = progress.total;
             progress.total = 0;
             for (cargo_version, _) in range {
@@ -153,7 +153,7 @@ fn exec_on_workspace(cx: &Context) -> Result<()> {
             cx.cargo_version,
         )?;
     }
-    let keep_going = keep_going.lock().unwrap();
+    let keep_going = unpoison_mutex(keep_going.lock());
     if keep_going.count > 0 {
         eprintln!();
         error!("{keep_going}");
@@ -195,7 +195,7 @@ fn determine_kind<'a>(
     progress: &sync::Arc<sync::Mutex<Progress>>,
     multiple_packages: bool,
 ) -> Kind<'a> {
-    let mut progress = progress.lock().unwrap();
+    let mut progress = unpoison_mutex(progress.lock());
     assert!(cx.subcommand.is_some());
     if cx.ignore_private && cx.is_private(id) {
         info!("skipped running on private package `{}`", cx.name_verbose(id));
@@ -511,7 +511,7 @@ fn exec_cargo(
     let res = exec_cargo_inner(cx, id, line, progress);
     if cx.keep_going {
         if let Err(e) = res {
-            let mut keep_going = keep_going.lock().unwrap();
+            let mut keep_going = unpoison_mutex(keep_going.lock());
             error!("{e:#}");
             keep_going.count = keep_going.count.saturating_add(1);
             let name = cx.packages(id).name.clone();
@@ -533,7 +533,7 @@ fn exec_cargo_inner(
     progress: &sync::Arc<sync::Mutex<Progress>>,
 ) -> Result<()> {
     {
-        let mut progress = progress.lock().unwrap();
+        let mut progress = unpoison_mutex(progress.lock());
         if progress.count != 0 {
             eprintln!();
         }
@@ -570,4 +570,15 @@ fn cargo_clean(cx: &Context, id: Option<&PackageId>) -> Result<()> {
     }
 
     line.run()
+}
+
+fn unpoison_mutex<T>(lock: sync::LockResult<sync::MutexGuard<'_, T>>) -> sync::MutexGuard<'_, T> {
+    match lock {
+        Ok(res) => res,
+        Err(eres) => {
+            let res = eres.into_inner();
+            eprintln!("ERROR: Mutex Lock poisoned");
+            res
+        }
+    }
 }
