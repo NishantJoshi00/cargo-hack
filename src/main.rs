@@ -94,9 +94,9 @@ fn exec_on_workspace(cx: &Context) -> Result<()> {
                     progress.total += total * cx.target.len();
                 }
             }
-            let line = cmd!("cargo");
-            line
+            cmd!("cargo")
         };
+
         {
             // First, generate the lockfile using the oldest cargo specified.
             // https://github.com/taiki-e/cargo-hack/issues/105
@@ -132,26 +132,12 @@ fn exec_on_workspace(cx: &Context) -> Result<()> {
             let mut line = line.clone();
             line.leading_arg(toolchain);
             line.apply_context(cx);
-            exec_on_packages(
-                cx,
-                &packages,
-                line,
-                progress.clone(),
-                keep_going.clone(),
-                *cargo_version,
-            )
+            exec_on_packages(cx, &packages, line, &progress, &keep_going, *cargo_version)
         })?;
     } else {
         let mut line = cx.cargo();
         line.apply_context(cx);
-        exec_on_packages(
-            cx,
-            &packages,
-            line,
-            progress.clone(),
-            keep_going.clone(),
-            cx.cargo_version,
-        )?;
+        exec_on_packages(cx, &packages, line, &progress, &keep_going, cx.cargo_version)?;
     }
     let keep_going = unpoison_mutex(keep_going.lock());
     if keep_going.count > 0 {
@@ -180,11 +166,11 @@ enum Kind<'a> {
 
 impl ToString for Kind<'_> {
     fn to_string(&self) -> String {
-        String::from(match self {
-            &Kind::SkipAsPrivate => "skip_as_private",
-            &Kind::Normal => "normal",
-            &Kind::Each { .. } => "each",
-            &Kind::Powerset { .. } => "powerest",
+        String::from(match *self {
+            Kind::SkipAsPrivate => "skip_as_private",
+            Kind::Normal => "normal",
+            Kind::Each { .. } => "each",
+            Kind::Powerset { .. } => "powerest",
         })
     }
 }
@@ -347,8 +333,8 @@ fn exec_on_packages(
     cx: &Context,
     packages: &[(&PackageId, Kind<'_>)],
     mut line: ProcessBuilder<'_>,
-    progress: sync::Arc<sync::Mutex<Progress>>,
-    keep_going: sync::Arc<sync::Mutex<KeepGoing>>,
+    progress: &sync::Arc<sync::Mutex<Progress>>,
+    keep_going: &sync::Arc<sync::Mutex<KeepGoing>>,
     cargo_version: u32,
 ) -> Result<()> {
     if cx.target.is_empty() || cargo_version >= 64 {
@@ -372,6 +358,7 @@ fn exec_on_packages(
     }
 }
 
+#[allow(clippy::needless_pass_by_value)]
 fn exec_on_package(
     cx: &Context,
     id: &PackageId,
@@ -403,7 +390,7 @@ fn exec_on_package(
     line.arg("--target-dir");
     line.arg(target_dir);
 
-    exec_actual(cx, id, kind, &mut line, progress, keep_going)
+    exec_actual(cx, id, kind, &mut line, &progress, &keep_going)
 }
 
 fn exec_actual(
@@ -411,14 +398,14 @@ fn exec_actual(
     id: &PackageId,
     kind: &Kind<'_>,
     line: &mut ProcessBuilder<'_>,
-    progress: sync::Arc<sync::Mutex<Progress>>,
-    keep_going: sync::Arc<sync::Mutex<KeepGoing>>,
+    progress: &sync::Arc<sync::Mutex<Progress>>,
+    keep_going: &sync::Arc<sync::Mutex<KeepGoing>>,
 ) -> Result<()> {
     match kind {
         Kind::SkipAsPrivate => unreachable!(),
         Kind::Normal => {
             // only run with default features
-            return exec_cargo(cx, id, line, &progress, &keep_going);
+            return exec_cargo(cx, id, line, progress, keep_going);
         }
         Kind::Each { .. } | Kind::Powerset { .. } => {}
     }
@@ -436,19 +423,19 @@ fn exec_actual(
 
     if !cx.exclude_no_default_features {
         // run with no default features if the package has other features
-        exec_cargo(cx, id, &mut line, &progress, &keep_going)?;
+        exec_cargo(cx, id, &mut line, progress, keep_going)?;
     }
 
     match kind {
         Kind::Each { features } => {
             features.iter().try_for_each(|f| {
-                exec_cargo_with_features(cx, id, &line, &progress, &keep_going, Some(f))
+                exec_cargo_with_features(cx, id, &line, progress, keep_going, Some(f))
             })?;
         }
         Kind::Powerset { features } => {
             // The first element of a powerset is `[]` so it should be skipped.
             features.iter().skip(1).try_for_each(|f| {
-                exec_cargo_with_features(cx, id, &line, &progress, &keep_going, f)
+                exec_cargo_with_features(cx, id, &line, progress, keep_going, f)
             })?;
         }
         _ => unreachable!(),
@@ -461,7 +448,7 @@ fn exec_actual(
         // run with all features
         // https://github.com/taiki-e/cargo-hack/issues/42
         line.arg("--all-features");
-        exec_cargo(cx, id, &mut line, &progress, &keep_going)?;
+        exec_cargo(cx, id, &mut line, progress, keep_going)?;
     }
 
     Ok(())
@@ -477,7 +464,7 @@ fn exec_cargo_with_features(
 ) -> Result<()> {
     let mut line = line.clone();
     line.append_features(features);
-    exec_cargo(cx, id, &mut line, progress, &keep_going)
+    exec_cargo(cx, id, &mut line, progress, keep_going)
 }
 
 #[derive(Default)]
@@ -576,9 +563,9 @@ fn unpoison_mutex<T>(lock: sync::LockResult<sync::MutexGuard<'_, T>>) -> sync::M
     match lock {
         Ok(res) => res,
         Err(eres) => {
-            let res = eres.into_inner();
+            let res_inner = eres.into_inner();
             eprintln!("ERROR: Mutex Lock poisoned");
-            res
+            res_inner
         }
     }
 }
