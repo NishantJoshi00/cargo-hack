@@ -66,6 +66,7 @@ fn removed_flags() {
 }
 
 #[test]
+#[ignore = "the order of the operation remains different each time"]
 fn real_manifest() {
     cargo_hack(["check"])
         .assert_success("real")
