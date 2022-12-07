@@ -533,11 +533,7 @@ fn exec_cargo_inner(
         write!(msg, " ({}/{})", progress.count, progress.total).unwrap();
         info!("{msg}");
     }
-    let target_dir = env::current_dir().unwrap().join("target").join(format!(
-        "{}",
-        // kind.to_string(),
-        nanoid!()
-    ));
+    let target_dir = env::current_dir().unwrap().join("target").join(nanoid!().to_string());
     // line.arg("--target-dir");
     // line.arg(target_dir);
     line.run_with_env(("CARGO_TARGET_DIR", target_dir.to_str().unwrap()))
