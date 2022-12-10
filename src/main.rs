@@ -16,6 +16,7 @@ mod features;
 mod fs;
 mod manifest;
 mod metadata;
+mod multithread;
 mod restore;
 mod rustup;
 mod version;
@@ -29,7 +30,7 @@ use std::{
 
 use anyhow::{bail, Result};
 pub const CURRENT: &str = env!("CARGO_MANIFEST_DIR");
-use nanoid::nanoid;
+use multithread::{unpoison_mutex, TargetDirPool};
 use rayon::prelude::*;
 
 use crate::{
@@ -337,6 +338,7 @@ fn exec_on_packages(
     keep_going: &sync::Arc<sync::Mutex<KeepGoing>>,
     cargo_version: u32,
 ) -> Result<()> {
+    let target_dirs = TargetDirPool::new();
     if cx.target.is_empty() || cargo_version >= 64 {
         // TODO: Test that cargo multitarget does not break the resolver behavior required for a correct check.
         for target in &cx.target {
@@ -344,7 +346,7 @@ fn exec_on_packages(
             line.arg(target);
         }
         packages.par_iter().try_for_each(|(id, kind)| {
-            exec_on_package(cx, id, kind, &line, progress.clone(), keep_going.clone())
+            exec_on_package(cx, id, kind, &line, progress.clone(), keep_going.clone(), &target_dirs)
         })
     } else {
         cx.target.iter().try_for_each(|target| {
@@ -352,7 +354,15 @@ fn exec_on_packages(
             line.arg("--target");
             line.arg(target);
             packages.par_iter().try_for_each(|(id, kind)| {
-                exec_on_package(cx, id, kind, &line, progress.clone(), keep_going.clone())
+                exec_on_package(
+                    cx,
+                    id,
+                    kind,
+                    &line,
+                    progress.clone(),
+                    keep_going.clone(),
+                    &target_dirs,
+                )
             })
         })
     }
@@ -366,6 +376,7 @@ fn exec_on_package(
     line: &ProcessBuilder<'_>,
     progress: sync::Arc<sync::Mutex<Progress>>,
     keep_going: sync::Arc<sync::Mutex<KeepGoing>>,
+    target_dirs: &TargetDirPool,
 ) -> Result<()> {
     if let Kind::SkipAsPrivate = kind {
         return Ok(());
@@ -383,7 +394,7 @@ fn exec_on_package(
         );
     }
 
-    exec_actual(cx, id, kind, &mut line, &progress, &keep_going)
+    exec_actual(cx, id, kind, &mut line, &progress, &keep_going, target_dirs)
 }
 
 fn exec_actual(
@@ -393,12 +404,13 @@ fn exec_actual(
     line: &mut ProcessBuilder<'_>,
     progress: &sync::Arc<sync::Mutex<Progress>>,
     keep_going: &sync::Arc<sync::Mutex<KeepGoing>>,
+    target_dirs: &TargetDirPool,
 ) -> Result<()> {
     match kind {
         Kind::SkipAsPrivate => unreachable!(),
         Kind::Normal => {
             // only run with default features
-            return exec_cargo(cx, id, line, progress, keep_going);
+            return exec_cargo(cx, id, line, progress, keep_going, target_dirs);
         }
         Kind::Each { .. } | Kind::Powerset { .. } => {}
     }
@@ -416,19 +428,19 @@ fn exec_actual(
 
     if !cx.exclude_no_default_features {
         // run with no default features if the package has other features
-        exec_cargo(cx, id, &mut line, progress, keep_going)?;
+        exec_cargo(cx, id, &mut line, progress, keep_going, target_dirs)?;
     }
 
     match kind {
         Kind::Each { features } => {
             features.iter().try_for_each(|f| {
-                exec_cargo_with_features(cx, id, &line, progress, keep_going, Some(f))
+                exec_cargo_with_features(cx, id, &line, progress, keep_going, Some(f), target_dirs)
             })?;
         }
         Kind::Powerset { features } => {
             // The first element of a powerset is `[]` so it should be skipped.
             features.iter().skip(1).try_for_each(|f| {
-                exec_cargo_with_features(cx, id, &line, progress, keep_going, f)
+                exec_cargo_with_features(cx, id, &line, progress, keep_going, f, target_dirs)
             })?;
         }
         _ => unreachable!(),
@@ -441,7 +453,7 @@ fn exec_actual(
         // run with all features
         // https://github.com/taiki-e/cargo-hack/issues/42
         line.arg("--all-features");
-        exec_cargo(cx, id, &mut line, progress, keep_going)?;
+        exec_cargo(cx, id, &mut line, progress, keep_going, target_dirs)?;
     }
 
     Ok(())
@@ -454,10 +466,11 @@ fn exec_cargo_with_features(
     progress: &sync::Arc<sync::Mutex<Progress>>,
     keep_going: &sync::Arc<sync::Mutex<KeepGoing>>,
     features: impl IntoIterator<Item = impl AsRef<str>>,
+    target_dirs: &TargetDirPool,
 ) -> Result<()> {
     let mut line = line.clone();
     line.append_features(features);
-    exec_cargo(cx, id, &mut line, progress, keep_going)
+    exec_cargo(cx, id, &mut line, progress, keep_going, target_dirs)
 }
 
 #[derive(Default)]
@@ -487,8 +500,9 @@ fn exec_cargo(
     line: &mut ProcessBuilder<'_>,
     progress: &sync::Arc<sync::Mutex<Progress>>,
     keep_going: &sync::Arc<sync::Mutex<KeepGoing>>,
+    target_dirs: &TargetDirPool,
 ) -> Result<()> {
-    let res = exec_cargo_inner(cx, id, line, progress);
+    let res = exec_cargo_inner(cx, id, line, progress, target_dirs);
     if cx.keep_going {
         if let Err(e) = res {
             let mut keep_going = unpoison_mutex(keep_going.lock());
@@ -511,6 +525,7 @@ fn exec_cargo_inner(
     id: &PackageId,
     line: &mut ProcessBuilder<'_>,
     progress: &sync::Arc<sync::Mutex<Progress>>,
+    target_dirs: &TargetDirPool,
 ) -> Result<()> {
     {
         let mut progress = unpoison_mutex(progress.lock());
@@ -533,10 +548,14 @@ fn exec_cargo_inner(
         write!(msg, " ({}/{})", progress.count, progress.total).unwrap();
         info!("{msg}");
     }
-    let target_dir = env::current_dir().unwrap().join("target").join(nanoid!().to_string());
+
+    let target_dir_inner = target_dirs.get();
+    let target_dir = env::current_dir().unwrap().join("target").join(&target_dir_inner);
     // line.arg("--target-dir");
     // line.arg(target_dir);
-    line.run_with_env(("CARGO_TARGET_DIR", target_dir.to_str().unwrap()))
+    line.run_with_env(("CARGO_TARGET_DIR", target_dir.to_str().unwrap()))?;
+    target_dirs.give_back(target_dir_inner);
+    Ok(())
 }
 
 fn cargo_clean(cx: &Context, id: Option<&PackageId>) -> Result<()> {
@@ -553,15 +572,4 @@ fn cargo_clean(cx: &Context, id: Option<&PackageId>) -> Result<()> {
     }
 
     line.run()
-}
-
-fn unpoison_mutex<T>(lock: sync::LockResult<sync::MutexGuard<'_, T>>) -> sync::MutexGuard<'_, T> {
-    match lock {
-        Ok(res) => res,
-        Err(eres) => {
-            let res_inner = eres.into_inner();
-            eprintln!("ERROR: Mutex Lock poisoned");
-            res_inner
-        }
-    }
 }
